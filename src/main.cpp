@@ -1,8 +1,12 @@
 #include <Arduino.h>
 
 // ====== SENSOR ======
-int sensorPins[5] = {32, 33, 34, 35, 25};
+int sensorPins[5] = {32, 33, 34, 35, 4};
 int weights[5] = {-2, -1, 0, 1, 2};
+
+#define USE_LINE_PID     1
+#define USE_ENCODER_PID  0
+#define USE_FEEDFORWARD  0
 
 // ====== MOTOR ======
 #define ENA  25
@@ -13,6 +17,8 @@ int weights[5] = {-2, -1, 0, 1, 2};
 #define IN3  12
 #define IN4  13
 
+#define ENCODER_RIGHT 19
+#define ENCODER_LEFT 18
 
 // ====== PID ======
 float Kp = 20;
@@ -26,9 +32,58 @@ float integral = 0;
 // ====== SPEED ======
 int baseSpeed = 150;
 
-// =============================
+float Kp_s = 1.0;
+float Ki_s = 0;
+float Kd_s = 0;
 
-float getError() {
+float lastErrL = 0, lastErrR = 0;
+float intL = 0, intR = 0;
+
+// =============================
+volatile int pulseLeft = 0;
+
+
+volatile int pulseRight = 0;
+
+void IRAM_ATTR isrRight() {
+    pulseRight++;
+}
+
+void IRAM_ATTR isrLeft() {
+    pulseLeft++;
+}
+
+float getSpeedLeft() {
+    static int lastPulse = 0;
+    static unsigned long lastTime = 0;
+
+    unsigned long now = millis();
+    int delta = pulseLeft - lastPulse;
+
+    float speed = delta / (now - lastTime + 1); // tránh chia 0
+
+    lastPulse = pulseLeft;
+    lastTime = now;
+
+    return speed;
+}
+
+float getSpeedRight() {
+    static int lastPulse = 0;
+    static unsigned long lastTime = 0;
+
+    unsigned long now = millis();
+    int delta = pulseRight - lastPulse;
+
+    float speed = delta / (now - lastTime + 1); // tránh chia 0
+
+    lastPulse = pulseRight;
+    lastTime = now;
+
+    return speed;
+}
+
+float getLineError() {
     int sum = 0;
     int count = 0;
 
@@ -44,18 +99,6 @@ float getError() {
     if (count == 0) return last_error; // mất line
 
     return (float)sum / count;
-}
-
-// =============================
-
-float PID_control(float error) {
-    integral += error;
-    float derivative = error - last_error;
-
-    float output = Kp * error + Ki * integral + Kd * derivative;
-
-    last_error = error;
-    return output;
 }
 
 // =============================
@@ -88,6 +131,48 @@ void setMotor(int left, int right) {
     ledcWrite(1, right);
 }
 
+float PID_line(float error) {
+    integral += error;
+    float derivative = error - last_error;
+
+    float output = Kp * error + Ki * integral + Kd * derivative;
+
+    last_error = error;
+    return output;
+}
+
+float PID_left(float target, float current) {
+    static unsigned long lastTime = 0;
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+
+    float err = target - current;
+    intL += err * dt;
+    float d = (err - lastErrL) / (dt + 1e-6);
+
+    float out = Kp_s * err + Ki_s * intL + Kd_s * d;
+
+    lastErrL = err;
+    lastTime = now;
+    return out;
+}
+
+float PID_right(float target, float current) {
+    static unsigned long lastTime = 0;
+    unsigned long now = millis();
+    float dt = (now - lastTime) / 1000.0;
+
+    float err = target - current;
+    intR += err * dt;
+    float d = (err - lastErrR) / (dt + 1e-6);
+
+    float out = Kp_s * err + Ki_s * intR + Kd_s * d;
+
+    lastErrR = err;
+    lastTime = now;
+    return out;
+}
+
 // =============================
 
 void setup() {
@@ -107,23 +192,68 @@ void setup() {
 
     ledcSetup(1, 5000, 8);
     ledcAttachPin(ENB, 1);
+
+    attachInterrupt(digitalPinToInterrupt(ENCODER_LEFT), isrLeft, RISING);
+    attachInterrupt(digitalPinToInterrupt(ENCODER_RIGHT), isrRight, RISING);
 }
 
 // =============================
 
 void loop() {
-    error = getError();
+    
+    // ===== LINE =====
+    float error = 0, correction = 0;
 
-    float output = PID_control(error);
+    if (USE_LINE_PID) {
+        error = getLineError();
+        correction = PID_line(error);
+    }
 
-    int leftSpeed = baseSpeed + output;
-    int rightSpeed = baseSpeed - output;
+    // ===== TARGET =====
+    float left_target  = baseSpeed + correction;
+    float right_target = baseSpeed - correction;
 
-    setMotor(leftSpeed, rightSpeed);
+    // ===== CURRENT =====
+    float left_current = 0;
+    float right_current = 0;
 
-    // DEBUG
-    Serial.print("Error: ");
-    Serial.print(error);
-    Serial.print(" | Output: ");
-    Serial.println(output);
+    if (USE_ENCODER_PID) {
+        left_current  = getSpeedLeft();
+        right_current = getSpeedRight();
+    }
+
+    // ===== FEED FORWARD =====
+    float Kff = 1.0;
+    float FF_left = 0, FF_right = 0;
+
+    if (USE_FEEDFORWARD) {
+        FF_left  = Kff * left_target;
+        FF_right = Kff * right_target;
+    }
+
+    // ===== PID SPEED =====
+    float pidL = 0, pidR = 0;
+
+    if (USE_ENCODER_PID) {
+        pidL = PID_left(left_target, left_current);
+        pidR = PID_right(right_target, right_current);
+    }
+
+    // ===== OUTPUT =====
+    int leftPWM, rightPWM;
+
+    if (USE_ENCODER_PID || USE_FEEDFORWARD) {
+        leftPWM  = FF_left  + pidL;
+        rightPWM = FF_right + pidR;
+    } else {
+        leftPWM  = left_target;
+        rightPWM = right_target;
+    }
+
+    setMotor(leftPWM, rightPWM);
+Serial.print("L: ");
+Serial.print(left_current);
+Serial.print(" | R: ");
+Serial.println(right_current);
+delay(10); // ~100Hz
 }
